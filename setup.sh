@@ -2,6 +2,7 @@
 
 git clone https://github.com/uyorum/rpi-docker-mirakurun-epgstation.git
 cd rpi-docker-mirakurun-epgstation
+git checkout mine
 cp docker-compose-sample.yml docker-compose.yml
 cp epgstation/config/enc.js.template epgstation/config/enc.js
 cp epgstation/config/config.yml.template epgstation/config/config.yml

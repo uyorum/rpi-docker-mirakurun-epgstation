@@ -12,7 +12,7 @@ Raspberry Piで動かすための最適化済み
 ## インストール手順
 
 ```sh
-curl -sf https://raw.githubusercontent.com/uyorum/rpi-docker-mirakurun-epgstation/v2/setup.sh | sh -s
+curl -sf https://raw.githubusercontent.com/uyorum/rpi-docker-mirakurun-epgstation/mine/setup.sh | sh -s
 cd rpi-docker-mirakurun-epgstation
 
 #チャンネル設定
