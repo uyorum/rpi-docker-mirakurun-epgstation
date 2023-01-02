@@ -1,6 +1,7 @@
-# docker-mirakurun-epgstation
+# rpi-docker-mirakurun-epgstation
 
 [Mirakurun](https://github.com/Chinachu/Mirakurun) + [EPGStation](https://github.com/l3tnun/EPGStation) の Docker コンテナ
+Raspberry Piで動かすための最適化済み
 
 ## 前提条件
 
@@ -11,8 +12,8 @@
 ## インストール手順
 
 ```sh
-curl -sf https://raw.githubusercontent.com/l3tnun/docker-mirakurun-epgstation/v2/setup.sh | sh -s
-cd docker-mirakurun-epgstation
+curl -sf https://raw.githubusercontent.com/uyorum/rpi-docker-mirakurun-epgstation/v2/setup.sh | sh -s
+cd rpi-docker-mirakurun-epgstation
 
 #チャンネル設定
 vim mirakurun/conf/channels.yml
@@ -24,7 +25,7 @@ vim docker-compose.yml
 ## 起動
 
 ```sh
-sudo docker-compose up -d
+sudo docker compose up -d
 ```
 
 ## チャンネルスキャン地上波のみ(取得漏れが出る場合もあるので注意)
@@ -38,18 +39,18 @@ mirakurun の EPG 更新を待ってからブラウザで http://DockerHostIP:88
 ## 停止
 
 ```sh
-sudo docker-compose down
+sudo docker compose down
 ```
 
 ## 更新
 
 ```sh
 # mirakurunとdbを更新
-sudo docker-compose pull
+sudo docker compose pull
 # epgstationを更新
-sudo docker-compose build --pull
+sudo docker compose build --pull
 # 最新のイメージを元に起動
-sudo docker-compose up -d
+sudo docker compose up -d
 ```
 
 ## 設定
