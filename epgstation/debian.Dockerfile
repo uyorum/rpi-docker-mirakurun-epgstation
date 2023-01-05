@@ -1,7 +1,9 @@
 FROM l3tnun/epgstation:master-debian
 
-ENV DEV="make gcc git g++ automake curl wget autoconf build-essential libass-dev libfreetype6-dev libsdl1.2-dev libtheora-dev libtool libva-dev libvdpau-dev libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev pkg-config texinfo zlib1g-dev"
-ENV FFMPEG_VERSION=4.2.4
+ENV DEV="make gcc git g++ automake curl wget patch autoconf build-essential libass-dev libfreetype6-dev libsdl1.2-dev libtheora-dev libtool libva-dev libvdpau-dev libvorbis-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev pkg-config texinfo zlib1g-dev"
+ENV FFMPEG_VERSION=4.4.3
+COPY ffmpeg-${FFMPEG_VERSION}.patch /tmp
+COPY include /opt/vc/include
 
 # Path to OpenMAX hardware encoding libraries. They are part of Raspberry Pi firmware.
 ENV LD_LIBRARY_PATH=/opt/vc/lib
@@ -16,6 +18,7 @@ RUN apt-get update && \
     mkdir /tmp/ffmpeg_sources && \
     cd /tmp/ffmpeg_sources && \
     curl -fsSL http://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.bz2 | tar -xj --strip-components=1 && \
+    patch -p1 < /tmp/ffmpeg-${FFMPEG_VERSION}.patch && \
     ./configure \
     --prefix=/usr/local \
     --disable-shared \
