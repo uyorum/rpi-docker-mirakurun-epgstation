@@ -49,11 +49,12 @@ services:
             dockerfile: "debian.Dockerfile"
         volumes:
             - ./epgstation/config:/app/config
-            - ./epgstation/data:/app/data
             - ./epgstation/thumbnail:/app/thumbnail
             - ./epgstation/logs:/app/logs
             - ./recorded:/app/recorded
             - /opt/vc/lib:/opt/vc/lib:ro
+        tmpfs:
+            - /app/data
         environment:
             TZ: "Asia/Tokyo"
         depends_on:
