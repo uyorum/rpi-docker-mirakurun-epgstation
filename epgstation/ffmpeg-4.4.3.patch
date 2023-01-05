@@ -1,0 +1,854 @@
+diff --git a/configure b/configure
+index 89af70d72f..d6f0527a92 100755
+--- a/configure
++++ b/configure
+@@ -3667,6 +3667,7 @@ libvmaf_filter_deps="libvmaf pthreads"
+ zmq_filter_deps="libzmq"
+ zoompan_filter_deps="swscale"
+ zscale_filter_deps="libzimg const_nan"
++scale_omx_filter_deps="omx"
+ scale_vaapi_filter_deps="vaapi"
+ scale_vulkan_filter_deps="vulkan libglslang"
+ vpp_qsv_filter_deps="libmfx"
+diff --git a/libavcodec/omx.c b/libavcodec/omx.c
+index 0a6a308309..f2423b3f2d 100644
+--- a/libavcodec/omx.c
++++ b/libavcodec/omx.c
+@@ -508,6 +508,15 @@ static av_cold int omx_component_init(AVCodecContext *avctx, const char *role)
+     CHECK(err);
+     s->num_out_buffers = out_port_params.nBufferCountActual;
+ 
++    // aspect ratio
++    OMX_CONFIG_POINTTYPE config;
++    INIT_STRUCT(config);
++    config.nPortIndex = s->out_port;
++    config.nX = avctx->sample_aspect_ratio.num;
++    config.nY = avctx->sample_aspect_ratio.den;
++    err = OMX_SetParameter(s->handle, 0x7f00004d, &config);
++    CHECK(err);
++
+     INIT_STRUCT(vid_param_bitrate);
+     vid_param_bitrate.nPortIndex     = s->out_port;
+     vid_param_bitrate.eControlRate   = OMX_Video_ControlRateVariable;
+@@ -744,7 +753,7 @@ static int omx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+         buffer = get_buffer(&s->input_mutex, &s->input_cond,
+                             &s->num_free_in_buffers, s->free_in_buffers, 1);
+ 
+-        buffer->nFilledLen = av_image_fill_arrays(dst, linesize, buffer->pBuffer, avctx->pix_fmt, s->stride, s->plane_size, 1);
++        buffer->nFilledLen = av_image_get_buffer_size(avctx->pix_fmt, s->stride, s->plane_size, 1);
+ 
+         if (s->input_zerocopy) {
+             uint8_t *src[4] = { NULL };
+@@ -793,7 +802,7 @@ static int omx_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+             need_copy = 1;
+         }
+         if (need_copy)
+-            av_image_copy(dst, linesize, (const uint8_t**) frame->data, frame->linesize, avctx->pix_fmt, avctx->width, avctx->height);
++            av_image_copy_to_buffer(buffer->pBuffer, buffer->nFilledLen, (const uint8_t**) frame->data, frame->linesize, avctx->pix_fmt, avctx->width, avctx->height, 1);
+         buffer->nFlags = OMX_BUFFERFLAG_ENDOFFRAME;
+         buffer->nOffset = 0;
+         // Convert the timestamps to microseconds; some encoders can ignore
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index b2c254ea67..ab28f09606 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -395,6 +395,7 @@ OBJS-$(CONFIG_SCALE_FILTER)                  += vf_scale.o scale_eval.o
+ OBJS-$(CONFIG_SCALE_CUDA_FILTER)             += vf_scale_cuda.o scale_eval.o \
+                                                 vf_scale_cuda.ptx.o vf_scale_cuda_bicubic.ptx.o
+ OBJS-$(CONFIG_SCALE_NPP_FILTER)              += vf_scale_npp.o scale_eval.o
++OBJS-$(CONFIG_SCALE_OMX_FILTER)              += vf_scale_omx.o
+ OBJS-$(CONFIG_SCALE_QSV_FILTER)              += vf_scale_qsv.o
+ OBJS-$(CONFIG_SCALE_VAAPI_FILTER)            += vf_scale_vaapi.o scale_eval.o vaapi_vpp.o
+ OBJS-$(CONFIG_SCALE_VULKAN_FILTER)           += vf_scale_vulkan.o vulkan.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 0872c6e0f2..c76bf2d842 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -527,6 +527,7 @@ extern  AVFilter ff_asink_abuffer;
+ extern  AVFilter ff_vsink_buffer;
+ extern AVFilter ff_af_afifo;
+ extern AVFilter ff_vf_fifo;
++extern AVFilter ff_vf_scale_omx;
+ 
+ #include "libavfilter/filter_list.c"
+ 
+diff --git a/libavfilter/vf_scale_omx.c b/libavfilter/vf_scale_omx.c
+new file mode 100644
+index 0000000000..9cf4495cb2
+--- /dev/null
++++ b/libavfilter/vf_scale_omx.c
+@@ -0,0 +1,774 @@
++/*
++ * Copyright (c) 2010 Bobby Bingham
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * scale video filter (omx hardware scaling)
++ */
++
++#include "config.h"
++
++#if CONFIG_OMX_RPI
++#define OMX_SKIP64BIT
++#endif
++
++#include <dlfcn.h>
++#include <OMX_Core.h>
++#include <OMX_Component.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <sys/time.h>
++
++#include "libavutil/avstring.h"
++#include "libavutil/avutil.h"
++#include "libavutil/common.h"
++#include "libavutil/imgutils.h"
++#include "libavutil/log.h"
++#include "libavutil/opt.h"
++#include "libavutil/eval.h"
++#include "libavutil/mathematics.h"
++#include "libavutil/parseutils.h"
++#include "libavutil/pixdesc.h"
++
++#include "avfilter.h"
++#include "scale_eval.h"
++#include "internal.h"
++
++#define INIT_STRUCT(x) do {                                               \
++        x.nSize = sizeof(x);                                              \
++        x.nVersion = s->version;                                          \
++    } while (0)
++
++#define CHECK(x) do {                                                     \
++        if (x != OMX_ErrorNone) {                                         \
++            av_log(avctx, AV_LOG_ERROR,                                   \
++                   "err %x (%d) on line %d\n", x, x, __LINE__);           \
++            return AVERROR_UNKNOWN;                                       \
++        }                                                                 \
++    } while (0)
++
++typedef struct OMXContext {
++    void *lib;
++    void *lib2;
++    OMX_ERRORTYPE (*ptr_Init)(void);
++    OMX_ERRORTYPE (*ptr_Deinit)(void);
++    OMX_ERRORTYPE (*ptr_ComponentNameEnum)(OMX_STRING, OMX_U32, OMX_U32);
++    OMX_ERRORTYPE (*ptr_GetHandle)(OMX_HANDLETYPE*, OMX_STRING, OMX_PTR, OMX_CALLBACKTYPE*);
++    OMX_ERRORTYPE (*ptr_FreeHandle)(OMX_HANDLETYPE);
++    OMX_ERRORTYPE (*ptr_GetComponentsOfRole)(OMX_STRING, OMX_U32*, OMX_U8**);
++    OMX_ERRORTYPE (*ptr_GetRolesOfComponent)(OMX_STRING, OMX_U32*, OMX_U8**);
++    void (*host_init)(void);
++} OMXContext;
++
++typedef struct OMXScaleContext {
++    const AVClass *class;
++    char *libname;
++    char *libprefix;
++    OMXContext *omx_context;
++
++    AVFilterContext *avctx;
++
++    char component_name[OMX_MAX_STRINGNAME_SIZE];
++    OMX_VERSIONTYPE version;
++    OMX_HANDLETYPE handle;
++    int in_port, out_port;
++    OMX_COLOR_FORMATTYPE color_format;
++    int stride, plane_size;
++	int out_stride, out_plane_size;
++
++    int num_in_buffers, num_out_buffers;
++    OMX_BUFFERHEADERTYPE **in_buffer_headers;
++    OMX_BUFFERHEADERTYPE **out_buffer_headers;
++    int num_free_in_buffers;
++    OMX_BUFFERHEADERTYPE **free_in_buffers;
++    int num_done_out_buffers;
++    OMX_BUFFERHEADERTYPE **done_out_buffers;
++    pthread_mutex_t input_mutex;
++    pthread_cond_t input_cond;
++    pthread_mutex_t output_mutex;
++    pthread_cond_t output_cond;
++
++    pthread_mutex_t state_mutex;
++    pthread_cond_t state_cond;
++    OMX_STATETYPE state;
++    OMX_ERRORTYPE error;
++
++    int mutex_cond_inited;
++
++    int w, h;
++
++    char *w_expr;               ///< width  expression string
++    char *h_expr;               ///< height expression string
++
++    int force_original_aspect_ratio;
++    int force_divisible_by;
++
++} OMXScaleContext;
++
++
++static av_cold void *dlsym_prefixed(void *handle, const char *symbol, const char *prefix)
++{
++    char buf[50];
++    snprintf(buf, sizeof(buf), "%s%s", prefix ? prefix : "", symbol);
++    return dlsym(handle, buf);
++}
++
++static av_cold int omx_try_load(OMXContext *s, void *logctx,
++                                const char *libname, const char *prefix,
++                                const char *libname2)
++{
++    if (libname2) {
++        s->lib2 = dlopen(libname2, RTLD_NOW | RTLD_GLOBAL);
++        if (!s->lib2) {
++            av_log(logctx, AV_LOG_WARNING, "%s not found\n", libname2);
++            return AVERROR_FILTER_NOT_FOUND;
++        }
++        s->host_init = dlsym(s->lib2, "bcm_host_init");
++        if (!s->host_init) {
++            av_log(logctx, AV_LOG_WARNING, "bcm_host_init not found\n");
++            dlclose(s->lib2);
++            s->lib2 = NULL;
++            return AVERROR_FILTER_NOT_FOUND;
++        }
++    }
++    s->lib = dlopen(libname, RTLD_NOW | RTLD_GLOBAL);
++    if (!s->lib) {
++        av_log(logctx, AV_LOG_WARNING, "%s not found\n", libname);
++        return AVERROR_FILTER_NOT_FOUND;
++    }
++    s->ptr_Init                = dlsym_prefixed(s->lib, "OMX_Init", prefix);
++    s->ptr_Deinit              = dlsym_prefixed(s->lib, "OMX_Deinit", prefix);
++    s->ptr_ComponentNameEnum   = dlsym_prefixed(s->lib, "OMX_ComponentNameEnum", prefix);
++    s->ptr_GetHandle           = dlsym_prefixed(s->lib, "OMX_GetHandle", prefix);
++    s->ptr_FreeHandle          = dlsym_prefixed(s->lib, "OMX_FreeHandle", prefix);
++    s->ptr_GetComponentsOfRole = dlsym_prefixed(s->lib, "OMX_GetComponentsOfRole", prefix);
++    s->ptr_GetRolesOfComponent = dlsym_prefixed(s->lib, "OMX_GetRolesOfComponent", prefix);
++    if (!s->ptr_Init || !s->ptr_Deinit || !s->ptr_ComponentNameEnum ||
++        !s->ptr_GetHandle || !s->ptr_FreeHandle ||
++        !s->ptr_GetComponentsOfRole || !s->ptr_GetRolesOfComponent) {
++        av_log(logctx, AV_LOG_WARNING, "Not all functions found in %s\n", libname);
++        dlclose(s->lib);
++        s->lib = NULL;
++        if (s->lib2)
++            dlclose(s->lib2);
++        s->lib2 = NULL;
++        return AVERROR_FILTER_NOT_FOUND;
++    }
++    return 0;
++}
++
++static av_cold OMXContext *omx_init(void *logctx, const char *libname, const char *prefix)
++{
++    static const char * const libnames[] = {
++#if CONFIG_OMX_RPI
++        "/opt/vc/lib/libopenmaxil.so", "/opt/vc/lib/libbcm_host.so",
++#else
++        "libOMX_Core.so", NULL,
++        "libOmxCore.so", NULL,
++#endif
++        NULL
++    };
++    const char* const* nameptr;
++    int ret = AVERROR_FILTER_NOT_FOUND;
++    OMXContext *omx_context;
++
++    omx_context = av_mallocz(sizeof(*omx_context));
++    if (!omx_context)
++        return NULL;
++    if (libname) {
++        ret = omx_try_load(omx_context, logctx, libname, prefix, NULL);
++        if (ret < 0) {
++            av_free(omx_context);
++            return NULL;
++        }
++    } else {
++        for (nameptr = libnames; *nameptr; nameptr += 2)
++            if (!(ret = omx_try_load(omx_context, logctx, nameptr[0], prefix, nameptr[1])))
++                break;
++        if (!*nameptr) {
++            av_free(omx_context);
++            return NULL;
++        }
++    }
++
++    if (omx_context->host_init)
++        omx_context->host_init();
++    omx_context->ptr_Init();
++    return omx_context;
++}
++
++static av_cold void omx_deinit(OMXContext *omx_context)
++{
++    if (!omx_context)
++        return;
++    omx_context->ptr_Deinit();
++    dlclose(omx_context->lib);
++    av_free(omx_context);
++}
++
++static void append_buffer(pthread_mutex_t *mutex, pthread_cond_t *cond,
++                          int* array_size, OMX_BUFFERHEADERTYPE **array,
++                          OMX_BUFFERHEADERTYPE *buffer)
++{
++    pthread_mutex_lock(mutex);
++    array[(*array_size)++] = buffer;
++    pthread_cond_broadcast(cond);
++    pthread_mutex_unlock(mutex);
++}
++
++static OMX_BUFFERHEADERTYPE *get_buffer(pthread_mutex_t *mutex, pthread_cond_t *cond,
++                                        int* array_size, OMX_BUFFERHEADERTYPE **array,
++                                        int wait)
++{
++    OMX_BUFFERHEADERTYPE *buffer;
++    pthread_mutex_lock(mutex);
++    if (wait) {
++        while (!*array_size)
++           pthread_cond_wait(cond, mutex);
++    }
++    if (*array_size > 0) {
++        buffer = array[0];
++        (*array_size)--;
++        memmove(&array[0], &array[1], (*array_size) * sizeof(OMX_BUFFERHEADERTYPE*));
++    } else {
++        buffer = NULL;
++    }
++    pthread_mutex_unlock(mutex);
++    return buffer;
++}
++
++
++static OMX_ERRORTYPE event_handler(OMX_HANDLETYPE component, OMX_PTR app_data, OMX_EVENTTYPE event,
++                                   OMX_U32 data1, OMX_U32 data2, OMX_PTR event_data)
++{
++    OMXScaleContext *s = app_data;
++    // This uses casts in the printfs, since OMX_U32 actually is a typedef for
++    // unsigned long in official header versions (but there are also modified
++    // versions where it is something else).
++    switch (event) {
++    case OMX_EventError:
++        pthread_mutex_lock(&s->state_mutex);
++        av_log(s->avctx, AV_LOG_ERROR, "OMX error %"PRIx32"\n", (uint32_t) data1);
++        s->error = data1;
++        pthread_cond_broadcast(&s->state_cond);
++        pthread_mutex_unlock(&s->state_mutex);
++        break;
++    case OMX_EventCmdComplete:
++        if (data1 == OMX_CommandStateSet) {
++            pthread_mutex_lock(&s->state_mutex);
++            s->state = data2;
++            av_log(s->avctx, AV_LOG_VERBOSE, "OMX state changed to %"PRIu32"\n", (uint32_t) data2);
++            pthread_cond_broadcast(&s->state_cond);
++            pthread_mutex_unlock(&s->state_mutex);
++        } else if (data1 == OMX_CommandPortDisable) {
++            av_log(s->avctx, AV_LOG_VERBOSE, "OMX port %"PRIu32" disabled\n", (uint32_t) data2);
++        } else if (data1 == OMX_CommandPortEnable) {
++            av_log(s->avctx, AV_LOG_VERBOSE, "OMX port %"PRIu32" enabled\n", (uint32_t) data2);
++        } else {
++            av_log(s->avctx, AV_LOG_VERBOSE, "OMX command complete, command %"PRIu32", value %"PRIu32"\n",
++                                             (uint32_t) data1, (uint32_t) data2);
++        }
++        break;
++    case OMX_EventPortSettingsChanged:
++        av_log(s->avctx, AV_LOG_VERBOSE, "OMX port %"PRIu32" settings changed\n", (uint32_t) data1);
++        break;
++    default:
++        av_log(s->avctx, AV_LOG_VERBOSE, "OMX event %d %"PRIx32" %"PRIx32"\n",
++                                         event, (uint32_t) data1, (uint32_t) data2);
++        break;
++    }
++    return OMX_ErrorNone;
++}
++
++static OMX_ERRORTYPE empty_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
++                                       OMX_BUFFERHEADERTYPE *buffer)
++{
++    OMXScaleContext *s = app_data;
++    append_buffer(&s->input_mutex, &s->input_cond,
++                  &s->num_free_in_buffers, s->free_in_buffers, buffer);
++    return OMX_ErrorNone;
++}
++
++static OMX_ERRORTYPE fill_buffer_done(OMX_HANDLETYPE component, OMX_PTR app_data,
++                                      OMX_BUFFERHEADERTYPE *buffer)
++{
++    OMXScaleContext *s = app_data;
++    append_buffer(&s->output_mutex, &s->output_cond,
++                  &s->num_done_out_buffers, s->done_out_buffers, buffer);
++    return OMX_ErrorNone;
++}
++
++static const OMX_CALLBACKTYPE callbacks = {
++    event_handler,
++    empty_buffer_done,
++    fill_buffer_done
++};
++
++static av_cold int find_component(OMXContext *omx_context, void *logctx,
++                                  const char *role, char *str, int str_size)
++{
++    OMX_U32 i, num = 0;
++    char **components;
++    int ret = 0;
++
++#if CONFIG_OMX_RPI
++    if (av_strstart(role, "resize", NULL)) {
++        av_strlcpy(str, "OMX.broadcom.resize", str_size);
++        return 0;
++    }
++#endif
++    omx_context->ptr_GetComponentsOfRole((OMX_STRING) role, &num, NULL);
++    if (!num) {
++        av_log(logctx, AV_LOG_WARNING, "No component for role %s found\n", role);
++        return AVERROR_FILTER_NOT_FOUND;
++    }
++    components = av_mallocz_array(num, sizeof(*components));
++    if (!components)
++        return AVERROR(ENOMEM);
++    for (i = 0; i < num; i++) {
++        components[i] = av_mallocz(OMX_MAX_STRINGNAME_SIZE);
++        if (!components[i]) {
++            ret = AVERROR(ENOMEM);
++            goto end;
++        }
++    }
++    omx_context->ptr_GetComponentsOfRole((OMX_STRING) role, &num, (OMX_U8**) components);
++    av_strlcpy(str, components[0], str_size);
++end:
++    for (i = 0; i < num; i++)
++        av_free(components[i]);
++    av_free(components);
++    return ret;
++}
++
++static av_cold int wait_for_state(OMXScaleContext *s, OMX_STATETYPE state)
++{
++    int ret = 0;
++    pthread_mutex_lock(&s->state_mutex);
++    while (s->state != state && s->error == OMX_ErrorNone)
++        pthread_cond_wait(&s->state_cond, &s->state_mutex);
++    if (s->error != OMX_ErrorNone)
++        ret = AVERROR_FILTER_NOT_FOUND;
++    pthread_mutex_unlock(&s->state_mutex);
++    return ret;
++}
++
++static av_cold int omx_component_init(AVFilterContext *avctx, const char *role, int in_width, int in_height, int out_width, int out_height)
++{
++    OMXScaleContext *s = avctx->priv;
++    OMX_PARAM_COMPONENTROLETYPE role_params = { 0 };
++    OMX_PORT_PARAM_TYPE image_port_params = { 0 };
++    OMX_PARAM_PORTDEFINITIONTYPE in_port_params = { 0 }, out_port_params = { 0 };
++    OMX_IMAGE_PARAM_PORTFORMATTYPE image_port_format = { 0 };
++    OMX_ERRORTYPE err;
++    int i;
++
++    s->version.s.nVersionMajor = 1;
++    s->version.s.nVersionMinor = 1;
++    s->version.s.nRevision     = 2;
++
++    err = s->omx_context->ptr_GetHandle(&s->handle, s->component_name, s, (OMX_CALLBACKTYPE*) &callbacks);
++    if (err != OMX_ErrorNone) {
++        av_log(avctx, AV_LOG_ERROR, "OMX_GetHandle(%s) failed: %x\n", s->component_name, err);
++        return AVERROR_UNKNOWN;
++    }
++
++    // This one crashes the mediaserver on qcom, if used over IOMX
++	INIT_STRUCT(role_params);
++    av_strlcpy(role_params.cRole, role, sizeof(role_params.cRole));
++    // Intentionally ignore errors on this one
++	err = OMX_SetParameter(s->handle, OMX_IndexParamStandardComponentRole, &role_params);
++
++	INIT_STRUCT(image_port_params);
++    err = OMX_GetParameter(s->handle, OMX_IndexParamImageInit, &image_port_params);
++    CHECK(err);
++
++	// port set
++    s->in_port = s->out_port = -1;
++    for (i = 0; i < image_port_params.nPorts; i++) {
++        int port = image_port_params.nStartPortNumber + i;
++        OMX_PARAM_PORTDEFINITIONTYPE port_params = { 0 };
++		INIT_STRUCT(port_params);
++        port_params.nPortIndex = port;
++        err = OMX_GetParameter(s->handle, OMX_IndexParamPortDefinition, &port_params);
++        if (err != OMX_ErrorNone) {
++            av_log(avctx, AV_LOG_WARNING, "port %d error %x\n", port, err);
++            break;
++        }
++        if (port_params.eDir == OMX_DirInput && s->in_port < 0) {
++            in_port_params = port_params;
++            s->in_port = port;
++        } else if (port_params.eDir == OMX_DirOutput && s->out_port < 0) {
++            out_port_params = port_params;
++            s->out_port = port;
++        }
++    }
++    if (s->in_port < 0 || s->out_port < 0) {
++        av_log(avctx, AV_LOG_ERROR, "No in or out port found (in %d out %d)\n", s->in_port, s->out_port);
++        return AVERROR_UNKNOWN;
++    }
++
++	// color_format set
++    s->color_format = 0;
++    for (i = 0; ; i++) {
++        INIT_STRUCT(image_port_format);
++        image_port_format.nIndex = i;
++        image_port_format.nPortIndex = s->in_port;
++        if (OMX_GetParameter(s->handle, OMX_IndexParamImagePortFormat, &image_port_format) != OMX_ErrorNone)
++            break;
++        if (image_port_format.eColorFormat == OMX_COLOR_FormatYUV420Planar ||
++            image_port_format.eColorFormat == OMX_COLOR_FormatYUV420PackedPlanar) {
++            s->color_format = image_port_format.eColorFormat;
++            break;
++        }
++    }
++    if (s->color_format == 0) {
++        av_log(avctx, AV_LOG_ERROR, "No supported pixel formats (%d formats available)\n", i);
++        return AVERROR_UNKNOWN;
++    }
++
++	// in_port_params set
++    in_port_params.bEnabled   = OMX_TRUE;
++    in_port_params.bPopulated = OMX_FALSE;
++    in_port_params.eDomain    = OMX_PortDomainImage;
++	in_port_params.format.image.eCompressionFormat    = OMX_IMAGE_CodingUnused;
++	in_port_params.format.image.bFlagErrorConcealment = OMX_FALSE;
++    in_port_params.format.image.eColorFormat          = s->color_format;
++	in_port_params.format.image.nFrameWidth  = in_width;
++	in_port_params.format.image.nFrameHeight = in_height;
++    in_port_params.format.image.nStride      = 0;
++    in_port_params.format.image.nSliceHeight = 0;
++
++    err = OMX_SetParameter(s->handle, OMX_IndexParamPortDefinition, &in_port_params);
++    CHECK(err);
++    err = OMX_GetParameter(s->handle, OMX_IndexParamPortDefinition, &in_port_params);
++    CHECK(err);
++
++    s->stride         = in_port_params.format.image.nStride;
++    s->plane_size     = in_port_params.format.image.nSliceHeight;
++    s->num_in_buffers = in_port_params.nBufferCountActual;
++
++	// out_port_params set
++	err = OMX_GetParameter(s->handle, OMX_IndexParamPortDefinition, &out_port_params);
++    out_port_params.bEnabled   = OMX_TRUE;
++    out_port_params.bPopulated = OMX_FALSE;
++    out_port_params.eDomain    = OMX_PortDomainImage;
++	out_port_params.format.image.eCompressionFormat    = OMX_IMAGE_CodingUnused;
++	out_port_params.format.image.bFlagErrorConcealment = OMX_FALSE;
++    out_port_params.format.image.eColorFormat          = s->color_format;
++    out_port_params.format.image.nFrameWidth   = out_width;
++    out_port_params.format.image.nFrameHeight  = out_height;
++    out_port_params.format.image.nStride       = 0;
++    out_port_params.format.image.nSliceHeight  = 0;
++
++    err = OMX_SetParameter(s->handle, OMX_IndexParamPortDefinition, &out_port_params);
++    CHECK(err);
++    err = OMX_GetParameter(s->handle, OMX_IndexParamPortDefinition, &out_port_params);
++    CHECK(err);
++
++    s->out_stride      = out_port_params.format.image.nStride;
++    s->out_plane_size  = out_port_params.format.image.nSliceHeight;
++    s->num_out_buffers = out_port_params.nBufferCountActual;
++
++	// buffer set
++    err = OMX_SendCommand(s->handle, OMX_CommandStateSet, OMX_StateIdle, NULL);
++    CHECK(err);
++
++    s->in_buffer_headers  = av_mallocz(sizeof(OMX_BUFFERHEADERTYPE*) * s->num_in_buffers);
++    s->free_in_buffers    = av_mallocz(sizeof(OMX_BUFFERHEADERTYPE*) * s->num_in_buffers);
++    s->out_buffer_headers = av_mallocz(sizeof(OMX_BUFFERHEADERTYPE*) * s->num_out_buffers);
++    s->done_out_buffers   = av_mallocz(sizeof(OMX_BUFFERHEADERTYPE*) * s->num_out_buffers);
++    if (!s->in_buffer_headers || !s->free_in_buffers || !s->out_buffer_headers || !s->done_out_buffers)
++        return AVERROR(ENOMEM);
++    for (i = 0; i < s->num_in_buffers && err == OMX_ErrorNone; i++) {
++		err = OMX_AllocateBuffer(s->handle, &s->in_buffer_headers[i],  s->in_port,  s, in_port_params.nBufferSize);
++        if (err == OMX_ErrorNone)
++            s->in_buffer_headers[i]->pAppPrivate = s->in_buffer_headers[i]->pOutputPortPrivate = NULL;
++    }
++    CHECK(err);
++    s->num_in_buffers = i;
++    for (i = 0; i < s->num_out_buffers && err == OMX_ErrorNone; i++)
++        err = OMX_AllocateBuffer(s->handle, &s->out_buffer_headers[i], s->out_port, s, out_port_params.nBufferSize);
++    CHECK(err);
++    s->num_out_buffers = i;
++
++	// State set
++    if (wait_for_state(s, OMX_StateIdle) < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Didn't get OMX_StateIdle\n");
++        return AVERROR_UNKNOWN;
++    }
++    err = OMX_SendCommand(s->handle, OMX_CommandStateSet, OMX_StateExecuting, NULL);
++    CHECK(err);
++    if (wait_for_state(s, OMX_StateExecuting) < 0) {
++        av_log(avctx, AV_LOG_ERROR, "Didn't get OMX_StateExecuting\n");
++        return AVERROR_UNKNOWN;
++    }
++
++	// out_buffer set
++    for (i = 0; i < s->num_out_buffers && err == OMX_ErrorNone; i++)
++        err = OMX_FillThisBuffer(s->handle, s->out_buffer_headers[i]);
++    if (err != OMX_ErrorNone) {
++        for (; i < s->num_out_buffers; i++)
++            s->done_out_buffers[s->num_done_out_buffers++] = s->out_buffer_headers[i];
++    }
++    for (i = 0; i < s->num_in_buffers; i++)
++        s->free_in_buffers[s->num_free_in_buffers++] = s->in_buffer_headers[i];
++
++    return err != OMX_ErrorNone ? AVERROR_UNKNOWN : 0;
++}
++
++static av_cold void cleanup(OMXScaleContext *s)
++{
++    int i, executing;
++
++    pthread_mutex_lock(&s->state_mutex);
++    executing = s->state == OMX_StateExecuting;
++    pthread_mutex_unlock(&s->state_mutex);
++
++    if (executing) {
++        OMX_SendCommand(s->handle, OMX_CommandStateSet, OMX_StateIdle, NULL);
++        wait_for_state(s, OMX_StateIdle);
++        OMX_SendCommand(s->handle, OMX_CommandStateSet, OMX_StateLoaded, NULL);
++        for (i = 0; i < s->num_in_buffers; i++) {
++            OMX_BUFFERHEADERTYPE *buffer = get_buffer(&s->input_mutex, &s->input_cond,
++                                                      &s->num_free_in_buffers, s->free_in_buffers, 1);
++            OMX_FreeBuffer(s->handle, s->in_port, buffer);
++        }
++        for (i = 0; i < s->num_out_buffers; i++) {
++            OMX_BUFFERHEADERTYPE *buffer = get_buffer(&s->output_mutex, &s->output_cond,
++                                                      &s->num_done_out_buffers, s->done_out_buffers, 1);
++            OMX_FreeBuffer(s->handle, s->out_port, buffer);
++        }
++        wait_for_state(s, OMX_StateLoaded);
++    }
++    if (s->handle) {
++        s->omx_context->ptr_FreeHandle(s->handle);
++        s->handle = NULL;
++    }
++
++    omx_deinit(s->omx_context);
++    s->omx_context = NULL;
++    if (s->mutex_cond_inited) {
++        pthread_cond_destroy(&s->state_cond);
++        pthread_mutex_destroy(&s->state_mutex);
++        pthread_cond_destroy(&s->input_cond);
++        pthread_mutex_destroy(&s->input_mutex);
++        pthread_cond_destroy(&s->output_cond);
++        pthread_mutex_destroy(&s->output_mutex);
++        s->mutex_cond_inited = 0;
++    }
++    av_freep(&s->in_buffer_headers);
++    av_freep(&s->out_buffer_headers);
++    av_freep(&s->free_in_buffers);
++    av_freep(&s->done_out_buffers);
++}
++
++static av_cold int omx_scale_init(AVFilterContext *avctx)
++{
++    OMXScaleContext *s = avctx->priv;
++
++    s->omx_context = omx_init(avctx, s->libname, s->libprefix);
++    if (!s->omx_context)
++        return AVERROR_FILTER_NOT_FOUND;
++
++    pthread_mutex_init(&s->state_mutex, NULL);
++    pthread_cond_init(&s->state_cond, NULL);
++    pthread_mutex_init(&s->input_mutex, NULL);
++    pthread_cond_init(&s->input_cond, NULL);
++    pthread_mutex_init(&s->output_mutex, NULL);
++    pthread_cond_init(&s->output_cond, NULL);
++    s->mutex_cond_inited = 1;
++    s->avctx = avctx;
++    s->state = OMX_StateLoaded;
++    s->error = OMX_ErrorNone;
++
++    return 0;
++}
++
++static int filter_frame(AVFilterLink *link, AVFrame *in)
++{
++    AVFilterContext *avctx = link->dst;
++    AVFilterLink *outlink = avctx->outputs[0];
++    AVFrame *out = NULL;
++    OMXScaleContext *s = avctx->priv;
++    OMX_BUFFERHEADERTYPE* buffer;
++    OMX_ERRORTYPE err;
++    int ret;
++
++	buffer = get_buffer(&s->input_mutex, &s->input_cond,
++						&s->num_free_in_buffers, s->free_in_buffers, 1);
++
++	buffer->nFilledLen = av_image_get_buffer_size(in->format, s->stride, s->plane_size, 1);
++	av_image_copy_to_buffer(buffer->pBuffer, buffer->nFilledLen, (const uint8_t**) in->data, in->linesize, in->format, s->stride, s->plane_size, 1);
++
++	err = OMX_EmptyThisBuffer(s->handle, buffer);
++	if (err != OMX_ErrorNone) {
++		append_buffer(&s->input_mutex, &s->input_cond, &s->num_free_in_buffers, s->free_in_buffers, buffer);
++		av_log(avctx, AV_LOG_ERROR, "OMX_EmptyThisBuffer failed: %x\n", err);
++		return AVERROR_UNKNOWN;
++	}
++
++    out = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!out) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++    ret = av_frame_copy_props(out, in);
++    if (ret < 0)
++		goto fail;
++
++	buffer = get_buffer(&s->output_mutex, &s->output_cond,
++						&s->num_done_out_buffers, s->done_out_buffers, 1);
++
++	av_image_fill_arrays(out->data, out->linesize, buffer->pBuffer, outlink->format, s->out_stride, s->out_plane_size, 1);
++
++	err = OMX_FillThisBuffer(s->handle, buffer);
++	if (err != OMX_ErrorNone) {
++		append_buffer(&s->output_mutex, &s->output_cond, &s->num_done_out_buffers, s->done_out_buffers, buffer);
++		av_log(avctx, AV_LOG_ERROR, "OMX_FillThisBuffer failed: %x\n", err);
++		ret = AVERROR_UNKNOWN;
++	}
++
++    av_frame_free(&in);
++
++	return ff_filter_frame(outlink, out);
++
++fail:
++	if (out)
++		av_frame_free(&out);
++    return ret;
++}
++
++static av_cold void omx_scale_end(AVFilterContext *avctx)
++{
++    OMXScaleContext *s = avctx->priv;
++
++    cleanup(s);
++}
++
++static int query_formats(AVFilterContext *avctx)
++{
++    static const enum AVPixelFormat pixel_formats[] = {
++        AV_PIX_FMT_YUV420P, AV_PIX_FMT_NONE,
++    };
++    AVFilterFormats *pix_fmts = ff_make_format_list(pixel_formats);
++
++    return ff_set_common_formats(avctx, pix_fmts);
++}
++
++static int config_props(AVFilterLink *outlink)
++{
++    AVFilterContext *avctx = outlink->src;
++    AVFilterLink *inlink = outlink->src->inputs[0];
++    OMXScaleContext *s = avctx->priv;
++	const char *role = "resize";
++    int w, h;
++    int ret;
++
++	ret = ff_scale_eval_dimensions(s, s->w_expr, s->h_expr, inlink, outlink, &w, &h);
++    if (ret < 0) return ret;
++	s->w = w;
++	s->h = h;
++
++    ff_scale_adjust_dimensions(inlink, &s->w, &s->h,
++                               s->force_original_aspect_ratio,
++                               s->force_divisible_by);
++
++    if (s->w > INT_MAX ||
++        s->h > INT_MAX ||
++        (s->h * inlink->w) > INT_MAX ||
++        (s->w * inlink->h) > INT_MAX)
++        av_log(avctx, AV_LOG_ERROR, "Rescaled value for width or height is too big.\n");
++
++    outlink->w = s->w;
++    outlink->h = s->h;
++
++    av_log(avctx, AV_LOG_VERBOSE, "w:%d h:%d -> w:%d h:%d\n",
++           inlink->w, inlink->h, outlink->w, outlink->h);
++
++    if (inlink->sample_aspect_ratio.num){
++        outlink->sample_aspect_ratio = av_mul_q((AVRational){outlink->h * inlink->w, outlink->w * inlink->h}, inlink->sample_aspect_ratio);
++    } else
++        outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++
++
++    if ((ret = find_component(s->omx_context, avctx, role, s->component_name, sizeof(s->component_name))) < 0)
++		return ret;
++
++    av_log(avctx, AV_LOG_INFO, "Using %s\n", s->component_name);
++
++    if ((ret = omx_component_init(avctx, role, inlink->w, inlink->h, outlink->w, outlink->h)) < 0)
++        return ret;
++
++    return 0;
++}
++
++
++#define OFFSET(x) offsetof(OMXScaleContext, x)
++#define FLAGS AV_OPT_FLAG_FILTERING_PARAM | AV_OPT_FLAG_VIDEO_PARAM
++static const AVOption scale_omx_options[] = {
++    { "w",     "Output video width",          OFFSET(w_expr),    AV_OPT_TYPE_STRING,        .flags = FLAGS },
++    { "width", "Output video width",          OFFSET(w_expr),    AV_OPT_TYPE_STRING,        .flags = FLAGS },
++    { "h",     "Output video height",         OFFSET(h_expr),    AV_OPT_TYPE_STRING,        .flags = FLAGS },
++    { "height","Output video height",         OFFSET(h_expr),    AV_OPT_TYPE_STRING,        .flags = FLAGS },
++    { "force_original_aspect_ratio", "decrease or increase w/h if necessary to keep the original AR", OFFSET(force_original_aspect_ratio), AV_OPT_TYPE_INT, { .i64 = 0}, 0, 2, FLAGS, "force_oar" },
++    { "force_divisible_by", "enforce that the output resolution is divisible by a defined integer when force_original_aspect_ratio is used", OFFSET(force_divisible_by), AV_OPT_TYPE_INT, { .i64 = 1}, 1, 256, FLAGS },
++	{ "omx_libname", "OpenMAX library name",     OFFSET(libname),   AV_OPT_TYPE_STRING, { 0 }, 0, 0, FLAGS },
++    { "omx_libprefix", "OpenMAX library prefix", OFFSET(libprefix), AV_OPT_TYPE_STRING, { 0 }, 0, 0, FLAGS },
++	{ NULL }
++};
++
++static const AVFilterPad avfilter_vf_scale_omx_inputs[] = {
++    {
++        .name         = "default",
++        .type         = AVMEDIA_TYPE_VIDEO,
++        .filter_frame = filter_frame,
++    },
++    { NULL }
++};
++
++static const AVFilterPad avfilter_vf_scale_omx_outputs[] = {
++    {
++        .name = "default",
++        .type = AVMEDIA_TYPE_VIDEO,
++        .config_props = config_props,
++    },
++    { NULL }
++};
++
++static const AVClass scale_omx_class = {
++    .class_name = "scale_omx",
++    .item_name  = av_default_item_name,
++    .option     = scale_omx_options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++AVFilter ff_vf_scale_omx = {
++    .name            = "scale_omx",
++    .description     = NULL_IF_CONFIG_SMALL("Scale the input video size."),
++    .init            = omx_scale_init,
++    .uninit          = omx_scale_end,
++    .query_formats   = query_formats,
++    .priv_size       = sizeof(OMXScaleContext),
++    .priv_class      = &scale_omx_class,
++    .inputs          = avfilter_vf_scale_omx_inputs,
++    .outputs         = avfilter_vf_scale_omx_outputs,
++};
