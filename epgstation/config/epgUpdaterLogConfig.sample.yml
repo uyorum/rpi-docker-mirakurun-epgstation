@@ -35,16 +35,13 @@ categories:
     level: info
   system: 
     appenders: 
-      - system
       - stdout
     level: info
   access: 
     appenders: 
-      - access
       - stdout
     level: info
   stream: 
     appenders: 
-      - stream
       - stdout
     level: info
