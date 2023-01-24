@@ -41,6 +41,10 @@ encode:
       cmd: '%NODE% %ROOT%/config/enc_omx.js'
       suffix: .mp4
       rate: 4.0
+    - name: H.264 OMX (Anime)
+      cmd: '%NODE% %ROOT%/config/enc_omx_anime.js'
+      suffix: .mp4
+      rate: 4.0
     - name: H.264
       cmd: '%NODE% %ROOT%/config/enc.js'
       suffix: .mp4

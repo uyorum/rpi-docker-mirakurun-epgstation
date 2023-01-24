@@ -13,7 +13,7 @@
 /epgstation/include
 /epgstation/config/*
 !/epgstation/config/enc.js.template
-!/epgstation/config/enc_omx.js
+!/epgstation/config/enc_*.js
 !/epgstation/config/config.yml.template
 !/epgstation/config/operatorLogConfig.sample.yml
 !/epgstation/config/epgUpdaterLogConfig.sample.yml
