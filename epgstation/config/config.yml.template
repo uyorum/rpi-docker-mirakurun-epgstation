@@ -95,7 +95,7 @@ stream:
             mp4:
                 - name: h264_omx
                   cmd:
-                      '%FFMPEG% -i pipe:0 -threads 0 -sn -c:a copy -bsf:a aac_adtstoasc
+                      '%FFMPEG% -dual_mono_mode main -i pipe:0 -threads 0 -sn -c:a aac -ar 48000 -b:a 192k -ac 2
                       -c:v h264_omx -b:v 5M -profile:v baseline -preset veryfast -aspect 16:9
                       -tune fastdecode,zerolatency -movflags frag_keyframe+empty_moov+faststart+default_base_moof -y -f mp4
                       pipe:1'
