@@ -1,3 +1,4 @@
+const fs = require('fs');
 const spawn = require('child_process').spawn;
 const execFile = require('child_process').execFile;
 const ffmpeg = process.env.FFMPEG;
@@ -52,6 +53,10 @@ if (isDualMono) {
     ]);
 } else {
     Array.prototype.push.apply(args, ['-map', '0:a']);
+    // 不要なストリームを削除
+    for (let s of [10, 11, 12, 13]) {
+        Array.prototype.push.apply(args, ['-map', `-0:${s}?`]);
+    };
 }
 Array.prototype.push.apply(args, ['-c:a', 'aac']);
 // 字幕ストリーム設定
@@ -161,6 +166,15 @@ Array.prototype.push.apply(args, [output]);
     child.on('error', err => {
         console.error(err);
         throw new Error(err);
+    });
+
+    // 出力ファイルのサイズが10KBより小さい場合は失敗とみなす
+    child.on('exit', (code) => {
+        var stat = fs.statSync(output);
+        if (stat.size < 10 * 1024) {
+            console.error(`File size ${stat.size} bytes is too small (< 10k). Raising error`);
+            throw new Error(1);
+        }
     });
 
     process.on('SIGINT', () => {
